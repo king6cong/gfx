@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::sync::{Arc, Mutex, RwLock};
 
 use hal::{format, image as i, pass, pso};
 use hal::memory::Properties;
@@ -7,6 +8,7 @@ use gl;
 use Backend;
 use std::borrow::Borrow;
 
+use std::collections::{HashMap, hash_map};
 
 pub type RawBuffer   = gl::types::GLuint;
 pub type Shader      = gl::types::GLuint;
@@ -16,12 +18,15 @@ pub type Surface     = gl::types::GLuint;
 pub type Texture     = gl::types::GLuint;
 pub type Sampler     = gl::types::GLuint;
 
+pub type DescriptorSetLayout = Vec<pso::DescriptorSetLayoutBinding>;
+
 pub const DEFAULT_FRAMEBUFFER: FrameBuffer = 0;
 
 #[derive(Debug)]
 pub struct Buffer {
     pub(crate) raw: RawBuffer,
     pub(crate) target: gl::types::GLenum,
+    pub(crate) size: u64,
 }
 
 #[derive(Debug)]
@@ -38,6 +43,72 @@ impl Fence {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum BindingTypes {
+    Images,
+    UniformBuffers,
+}
+
+#[derive(Clone, Debug)]
+pub struct DescRemapData {
+    bindings: HashMap<(BindingTypes, pso::DescriptorSetIndex, pso::DescriptorBinding), Vec<pso::DescriptorBinding>>,
+    names: HashMap<String, (BindingTypes, pso::DescriptorSetIndex, pso::DescriptorBinding)>,
+    next_binding: HashMap<BindingTypes, pso::DescriptorBinding>,
+}
+
+/// Stores where the descriptor bindings have been remaped too.
+///
+/// OpenGL doesn't support sets, so we have to flatten out the bindings.
+impl DescRemapData {
+    pub fn new() -> Self {
+        DescRemapData {
+            bindings: HashMap::new(),
+            names: HashMap::new(),
+            next_binding: HashMap::new(),
+        }
+    }
+
+    pub fn insert_missing_binding_into_spare(
+        &mut self,
+        btype: BindingTypes,
+        set: pso::DescriptorSetIndex,
+        binding: pso::DescriptorBinding,
+    ) -> &[pso::DescriptorBinding] {
+        let nb = self.next_binding.entry(btype).or_insert(0);
+        let val = self.bindings.entry((btype, set, binding)).or_insert(Vec::new());
+        val.push(*nb);
+        *nb += 1;
+        &*val
+    }
+
+    pub fn reserve_binding(&mut self, btype: BindingTypes) -> pso::DescriptorBinding {
+        let nb = self.next_binding.entry(btype).or_insert(0);
+        *nb += 1;
+        *nb - 1
+    }
+
+    pub fn insert_missing_binding(
+        &mut self,
+        nb: pso::DescriptorBinding,
+        btype: BindingTypes,
+        set: pso::DescriptorSetIndex,
+        binding: pso::DescriptorBinding,
+    ) -> &[pso::DescriptorBinding] {
+        let val = self.bindings.entry((btype, set, binding)).or_insert(Vec::new());
+        val.push(nb);
+        &*val
+    }
+
+    pub fn get_binding(
+        &self,
+        btype: BindingTypes,
+        set: pso::DescriptorSetIndex,
+        binding: pso::DescriptorBinding,
+    ) -> Option<&[pso::DescriptorBinding]> {
+        self.bindings.get(&(btype, set, binding)).map(AsRef::as_ref)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct GraphicsPipeline {
     pub(crate) program: Program,
@@ -48,7 +119,7 @@ pub struct GraphicsPipeline {
     pub(crate) vertex_buffers: Vec<Option<pso::VertexBufferDesc>>,
 }
 
-#[derive(Clone, Debug, Copy)]
+#[derive(Clone, Debug)]
 pub struct ComputePipeline {
     pub(crate) program: Program,
 }
@@ -82,10 +153,23 @@ pub enum ImageView {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
-pub struct DescriptorSetLayout;
+pub(crate) enum DescSetBindings {
+    Buffer {
+        ty: BindingTypes,
+        binding: pso::DescriptorBinding,
+        buffer: RawBuffer,
+        offset: gl::types::GLintptr,
+        size: gl::types::GLsizeiptr
+    },
+    Texture(pso::DescriptorBinding, Texture),
+    Sampler(pso::DescriptorBinding, Sampler),
+}
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
-pub struct DescriptorSet;
+#[derive(Clone, Debug)]
+pub struct DescriptorSet {
+    layout: DescriptorSetLayout,
+    pub(crate) bindings: Arc<Mutex<Vec<DescSetBindings>>>,
+}
 
 #[derive(Debug)]
 pub struct DescriptorPool {}
@@ -96,7 +180,10 @@ impl pso::DescriptorPool<Backend> for DescriptorPool {
         I: IntoIterator,
         I::Item: Borrow<DescriptorSetLayout>,
     {
-        layouts.into_iter().map(|_| Ok(DescriptorSet)).collect()
+        layouts.into_iter().map(|layout| Ok(DescriptorSet {
+            layout: layout.borrow().clone(),
+            bindings: Arc::new(Mutex::new(Vec::new())),
+        })).collect()
     }
 
     fn free_sets(&mut self, _descriptor_sets: &[DescriptorSet]) {
@@ -166,7 +253,9 @@ impl SubpassDesc {
 }
 
 #[derive(Debug)]
-pub struct PipelineLayout;
+pub struct PipelineLayout {
+    pub(crate) desc_remap_data: Arc<RwLock<DescRemapData>>,
+}
 
 #[derive(Debug)]
 // No inter-queue synchronization required for GL.
